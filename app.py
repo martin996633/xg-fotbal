@@ -8,151 +8,113 @@ from scipy.stats import poisson
 try:
     API_KEY = st.secrets["API_KEY"]
 except:
-    # Pokud nemáte nastaveno v secrets, vložte klíč sem
     API_KEY = "VÁŠ_API_KLÍČ_ZDE" 
 
 BASE_URL = "https://v3.football.api-sports.io"
-HEADERS = {
-    'x-rapidapi-host': "v3.football.api-sports.io",
-    'x-rapidapi-key': API_KEY
-}
+HEADERS = {'x-rapidapi-host': "v3.football.api-sports.io", 'x-rapidapi-key': API_KEY}
 
-# Váhy pro Heuristic xG Proxy (Klíčové pro přesnost bez oficiálního xG)
-WEIGHTS = {
-    'SOT': 0.40,      # Střely na bránu
-    'SIB': 0.35,      # Střely z vápna
-    'SOFF': 0.10,     # Střely mimo
-    'CORNERS': 0.15   # Rohy
-}
+# Váhy pro live intenzitu
+WEIGHTS = {'SOT': 0.45, 'SIB': 0.35, 'CORNERS': 0.20}
 
-class GlobalHtScanner:
-    """
-    Engine pro globální skenování a výpočet predikcí.
-    """
-    
+class LiveWorldwideScanner:
     @staticmethod
-    def fetch_statistics(fixture_id):
-        """Získá statistiky zápasu a namapuje je na Home/Away."""
+    def fetch_stats(fixture_id):
         url = f"{BASE_URL}/fixtures/statistics?fixture={fixture_id}"
         try:
             res = requests.get(url, headers=HEADERS).json().get('response', [])
-            stats_map = {
-                'home': {'sot': 0, 'sib': 0, 'soff': 0, 'corners': 0, 'da': 0, 'red': 0},
-                'away': {'sot': 0, 'sib': 0, 'soff': 0, 'corners': 0, 'da': 0, 'red': 0}
-            }
-            if not res: return stats_map
-
+            stats = {'home': {'sot':0, 'sib':0, 'corners':0, 'da':0, 'red':0},
+                     'away': {'sot':0, 'sib':0, 'corners':0, 'da':0, 'red':0}}
+            if not res: return stats
             for i, side in enumerate(['home', 'away']):
                 if i < len(res):
                     r = {item['type']: item['value'] for item in res[i]['statistics']}
-                    s = stats_map[side]
+                    s = stats[side]
                     s['sot'] = int(r.get('Shots on Goal') or 0)
                     s['sib'] = int(r.get('Shots insidebox') or 0)
-                    s['soff'] = int(r.get('Shots off Goal') or 0)
                     s['corners'] = int(r.get('Corner Kicks') or 0)
                     s['da'] = int(r.get('Dangerous Attacks') or 0)
                     s['red'] = int(r.get('Red Cards') or 0)
-            return stats_map
-        except:
-            return None
+            return stats
+        except: return None
 
     @staticmethod
-    def calculate_2h_lambda(stats_h, stats_a):
-        """Vypočítá očekávaný počet gólů (λ) pro 2. poločas."""
-        def get_team_intensity(s):
-            # Základní síla z kvality šancí
-            base = (s['sot'] * WEIGHTS['SOT']) + \
-                   (s['sib'] * WEIGHTS['SIB']) + \
-                   (s['corners'] * WEIGHTS['CORNERS'])
-            
-            # Multiplikátor pro nebezpečné útoky (Intenzita tlaku)
-            da_per_min = s['da'] / 45
-            if da_per_min > 1.2: base *= 1.25
-            elif da_per_min > 0.8: base *= 1.1
-            return base
-
-        # Sečtení sil obou týmů a aplikace koeficientu pro 2. poločas (0.9 - 1.1)
-        lam_2h = (get_team_intensity(stats_h) + get_team_intensity(stats_a)) * 0.95
+    def calculate_live_lambda(h, a, elapsed):
+        """Vypočítá λ pro ZBÝVAJÍCÍ čas zápasu."""
+        remaining_time = 90 - elapsed
+        if remaining_time <= 0: return 0.01
         
-        # Úprava pro červené karty (otevření prostorů na hřišti)
-        red_cards = stats_h['red'] + stats_a['red']
-        if red_cards > 0:
-            lam_2h *= (1 + (0.2 * red_cards))
+        def get_intensity(s):
+            # Výpočet aktivity na minutu, kterou tým doposud předvedl
+            base_perf = (s['sot'] * WEIGHTS['SOT']) + (s['sib'] * WEIGHTS['SIB']) + (s['corners'] * WEIGHTS['CORNERS'])
+            perf_per_min = base_perf / elapsed
             
-        return round(lam_2h, 2)
+            # Projekce této intenzity do zbývajícího času
+            projected_val = perf_per_min * remaining_time
+            
+            # Bonus za nebezpečné útoky (tlak)
+            da_per_min = s['da'] / elapsed
+            if da_per_min > 1.2: projected_val *= 1.2
+            return projected_val
 
-# --- STREAMLIT FRONTEND ---
+        # Součet projekcí obou týmů
+        total_lambda = (get_intensity(h) + get_intensity(a)) * 0.8 # Konzervativní koeficient
+        
+        # Korekce na červené karty
+        if (h['red'] + a['red']) > 0: total_lambda *= 1.2
+            
+        return round(total_lambda, 2)
 
-st.set_page_config(page_title="WORLDWIDE HT SCANNER", layout="wide")
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="LIVE WORLDWIDE SCANNER", layout="wide")
+st.title("⚽ Live Global Match Scanner")
+st.caption("Sledování všech probíhajících zápasů na světě v reálném čase.")
 
-st.title("🌎 Worldwide Football HT Goal Prediction Engine")
-st.markdown("---")
+# Filtry v sidebar
+st.sidebar.header("⚙️ Live Filtry")
+min_minute = st.sidebar.slider("Minimální minuta zápasu", 0, 90, 15)
+max_minute = st.sidebar.slider("Maximální minuta zápasu", 0, 90, 85)
 
-if st.button("🚀 SKENOVAT CELÝ SVĚT (Zápasy v poločase)", type="primary"):
-    # 1. Stažení všech live zápasů světa bez filtru na ligy
-    with st.spinner("Stahuji data o všech aktuálně hraných zápasech..."):
+if st.button("🚀 SKENOVAT ŽIVÉ ZÁPASY", type="primary"):
+    with st.spinner("Stahuji globální live data..."):
         url_live = f"{BASE_URL}/fixtures?live=all"
-        try:
-            live_fixtures = requests.get(url_live, headers=HEADERS).json().get('response', [])
-        except Exception as e:
-            st.error(f"Chyba spojení s API: {e}")
-            live_fixtures = []
-
-    # 2. Filtrace na stav "HT" (Halftime)
-    ht_matches = [m for m in live_fixtures if m['fixture']['status']['short'] == 'HT']
-
-    if not ht_matches:
-        st.warning("Aktuálně se nikde na světě nehraje poločasová pauza. Zkuste to za 10-15 minut.")
+        all_live = requests.get(url_live, headers=HEADERS).json().get('response', [])
+    
+    # Filtrace zápasů v aktivním čase
+    active_matches = [
+        m for m in all_live 
+        if m['fixture']['status']['short'] in ['1H', '2H', 'HT'] 
+        and min_minute <= (m['fixture']['status']['elapsed'] or 0) <= max_minute
+    ]
+    
+    if not active_matches:
+        st.warning("Žádné zápasy neodpovídají nastavenému časovému filtru.")
     else:
-        st.success(f"Nalezeno {len(ht_matches)} zápasů v poločase. Provádím hloubkovou analýzu...")
-        
+        st.success(f"Analyzuji {len(active_matches)} probíhajících zápasů...")
         results = []
         progress_bar = st.progress(0)
         
-        for i, match in enumerate(ht_matches):
-            fid = match['fixture']['id']
-            stats = GlobalHtScanner.fetch_statistics(fid)
+        for i, m in enumerate(active_matches):
+            fid = m['fixture']['id']
+            elapsed = m['fixture']['status']['elapsed']
+            stats = LiveWorldwideScanner.fetch_stats(fid)
             
-            if stats:
-                # Výpočet predikce
-                lam = GlobalHtScanner.calculate_2h_lambda(stats['home'], stats['away'])
+            if stats and elapsed > 0:
+                lam = LiveWorldwideScanner.calculate_live_lambda(stats['home'], stats['away'], elapsed)
                 
-                # Výpočet pravděpodobností pomocí Poissonovy distribuce
-                # P(alespoň 1 gól ve 2. poločase)
-                p_0_goals = poisson.pmf(0, lam)
-                prob_1_plus = round((1 - p_0_goals) * 100, 1)
-                
-                # P(alespoň 2 góly ve 2. poločase)
-                p_0_or_1_goal = poisson.pmf(0, lam) + poisson.pmf(1, lam)
-                prob_2_plus = round((1 - p_0_or_1_goal) * 100, 1)
+                # Poisson: Šance na alespoň 1 další gól do konce zápasu
+                prob_goal = round((1 - poisson.pmf(0, lam)) * 100, 1)
 
                 results.append({
-                    "Liga": match['league']['name'],
-                    "Země": match['league']['country'],
-                    "Zápas": f"{match['teams']['home']['name']} vs {match['teams']['away']['name']}",
-                    "Skóre (HT)": f"{match['goals']['home']}:{match['goals']['away']}",
-                    "Očekávané góly λ (2H)": lam,
-                    "Šance na gól (2H)": f"{prob_1_plus}%",
-                    "Šance na 2+ góly (2H)": f"{prob_2_plus}%",
-                    "Signál": "🔥 HIGH" if prob_1_plus > 75 else "⚠️ MEDIUM" if prob_1_plus > 55 else "🧊 LOW"
+                    "Min": f"{elapsed}'",
+                    "Liga": m['league']['name'],
+                    "Zápas": f"{m['teams']['home']['name']} vs {m['teams']['away']['name']}",
+                    "Skóre": f"{m['goals']['home']}:{m['goals']['away']}",
+                    "Zbývá λ": lam,
+                    "Šance na DALŠÍ GÓL": f"{prob_goal}%",
+                    "Status": "🔥 TLAK" if prob_goal > 70 else "⚖️ VYROVNANÉ" if prob_goal > 40 else "🧊 KLID"
                 })
-            
-            progress_bar.progress((i + 1) / len(ht_matches))
+            progress_bar.progress((i + 1) / len(active_matches))
         
         if results:
-            df = pd.DataFrame(results).sort_values(by="Očekávané góly λ (2H)", ascending=False)
-            
-            # Stylování tabulky
-            def color_signal(val):
-                if val == "🔥 HIGH": return 'background-color: #ffcccc; color: black; font-weight: bold;'
-                if val == "⚠️ MEDIUM": return 'background-color: #fff4cc; color: black;'
-                if val == "🧊 LOW": return 'background-color: #e6f7ff; color: grey;'
-                return ''
-
-            st.dataframe(
-                df.style.applymap(color_signal, subset=['Signál']),
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.error("Nepodařilo se získat detailní statistiky pro nalezené zápasy.")
+            df = pd.DataFrame(results).sort_values(by="Zbývá λ", ascending=False)
+            st.dataframe(df, use_container_width=True, hide_index=True)
