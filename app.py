@@ -24,7 +24,7 @@ LEAGUES = {
 }
 TOP5_IDS = [39, 140, 78, 135, 61]
 
-# ================= LOGIKA BOOKMAKERA =================
+# ================= DATA MINING =================
 
 def get_live_matches(league_selection):
     try:
@@ -38,7 +38,7 @@ def get_live_matches(league_selection):
         if league_selection == "top5":
             matches = [m for m in matches if m['league']['id'] in TOP5_IDS]
         return matches
-    except Exception:
+    except:
         return []
 
 def get_stats(fixture_id):
@@ -47,10 +47,10 @@ def get_stats(fixture_id):
         response = requests.get(url, headers=HEADERS)
         data = response.json().get('response', [])
         
-        # Inicializace s nulami
+        # Inicializace všech 14 metrik
         stats = {
-            'home': {'xg': 0.0, 'shots': 0, 'sot': 0, 'da': 0, 'attacks': 0, 'corners': 0, 'poss': 50, 'saves': 0},
-            'away': {'xg': 0.0, 'shots': 0, 'sot': 0, 'da': 0, 'attacks': 0, 'corners': 0, 'poss': 50, 'saves': 0}
+            'home': {'xg': 0.0, 'shots': 0, 'sot': 0, 'sib': 0, 'blocked': 0, 'da': 0, 'corners': 0, 'poss': 50, 'saves': 0, 'fouls': 0, 'yc': 0, 'rc': 0, 'passes': 0},
+            'away': {'xg': 0.0, 'shots': 0, 'sot': 0, 'sib': 0, 'blocked': 0, 'da': 0, 'corners': 0, 'poss': 50, 'saves': 0, 'fouls': 0, 'yc': 0, 'rc': 0, 'passes': 0}
         }
         
         if not data: return stats
@@ -69,21 +69,20 @@ def get_stats(fixture_id):
             s['xg'] = get_val('expected_goals', float)
             s['shots'] = get_val('Total Shots')
             s['sot'] = get_val('Shots on Goal')
-            s['da'] = get_val('Dangerous Attacks') # Klíčová metrika
-            s['attacks'] = get_val('Attacks')
+            s['sib'] = get_val('Shots insidebox')
+            s['blocked'] = get_val('Blocked Shots')
+            s['da'] = get_val('Dangerous Attacks')
             s['corners'] = get_val('Corner Kicks')
             s['poss'] = get_val('Ball Possession')
             s['saves'] = get_val('Goalkeeper Saves')
+            s['fouls'] = get_val('Fouls')
+            s['yc'] = get_val('Yellow Cards')
+            s['rc'] = get_val('Red Cards')
+            s['passes'] = get_val('Passes %')
             
         return stats
     except:
         return None
-
-def calculate_field_tilt(h_da, a_da):
-    """Výpočet náklonu hřiště (Kdo ovládá nebezpečné zóny)"""
-    total = h_da + a_da
-    if total == 0: return 50
-    return round((h_da / total) * 100, 1)
 
 def analyze_match(match):
     fix = match['fixture']
@@ -101,99 +100,104 @@ def analyze_match(match):
     g_h = goals['home'] or 0
     g_a = goals['away'] or 0
     
-    # === VÝPOČTY PROFI METRIK ===
+    # === VÝPOČTY (BOOKIE METRIKY) ===
     
-    # 1. Field Tilt (Kdo tlačí v nebezpečné zóně)
-    home_tilt = calculate_field_tilt(s_h['da'], s_a['da'])
+    # 1. Intensity (Dangerous Attacks per Minute)
+    da_min_h = round(s_h['da'] / elapsed, 2) if elapsed > 0 else 0
+    da_min_a = round(s_a['da'] / elapsed, 2) if elapsed > 0 else 0
     
-    # 2. Dangerous Attacks per Minute (Intenzita)
-    da_per_min_h = round(s_h['da'] / elapsed, 2) if elapsed > 0 else 0
-    da_per_min_a = round(s_a['da'] / elapsed, 2) if elapsed > 0 else 0
+    # 2. xG Diff (Actual - Expected) -> Záporné číslo = Smůla (Měli dát gól)
+    luck_h = round(g_h - s_h['xg'], 2)
+    luck_a = round(g_a - s_a['xg'], 2)
     
-    # 3. xG Diff (Spravedlnost výsledku)
-    xg_diff = (s_h['xg'] - g_h) + (s_a['xg'] - g_a) # Kladné = mělo padnout víc gólů
-    
-    # 4. Shot Quality (Průměrné xG na střelu)
+    # 3. Shot Quality (xG/Shot)
     qual_h = round(s_h['xg'] / s_h['shots'], 2) if s_h['shots'] > 0 else 0
     qual_a = round(s_a['xg'] / s_a['shots'], 2) if s_a['shots'] > 0 else 0
 
-    # === LOGIKA PREDICÍ (ALGORITMUS) ===
+    # === ALGORITMUS PREDIKCÍ ===
     tip = ""
-    sub_tip = ""
-    strength = 0
+    algo_color = ""
     
-    # A. SCÉNÁŘ: TOTÁLNÍ OBLÉHÁNÍ (Late Game Siege)
-    # Tým prohrává nebo remizuje, je konec zápasu a má obrovský Field Tilt
-    if elapsed > 70 and (g_h <= g_a) and home_tilt > 75 and da_per_min_h > 1.2:
-        tip = "💣 TOTAL SIEGE (Domácí)"
-        sub_tip = "Extrémní Field Tilt + Tlak"
-        strength = 3
-    elif elapsed > 70 and (g_a <= g_h) and home_tilt < 25 and da_per_min_a > 1.2:
-        tip = "💣 TOTAL SIEGE (Hosté)"
-        sub_tip = "Extrémní Field Tilt + Tlak"
-        strength = 3
+    # A. UNDER-DOG FIGHT (Brankář čaruje)
+    if (s_h['saves'] >= 5 and g_a <= 1) or (s_a['saves'] >= 5 and g_h <= 1):
+        tip = "🧱 ZÁMEK (GK Saves 5+)"
+        algo_color = "🔴" # Riziko gólu vysoké
 
-    # B. SCÉNÁŘ: FALEŠNÁ DOMINANCE (Value Trap)
-    # Tým má hodně střel, ale mizernou kvalitu. Trh sází Over, my jdeme Under/Remíza.
-    elif (s_h['shots'] > 12 and g_h == 0 and qual_h < 0.05):
-        tip = "⚠️ FALEŠNÁ DOMINANCE (Dom)"
-        sub_tip = "Mnoho střel, nulová kvalita"
-        strength = 2
-    elif (s_a['shots'] > 12 and g_a == 0 and qual_a < 0.05):
-        tip = "⚠️ FALEŠNÁ DOMINANCE (Host)"
-        sub_tip = "Mnoho střel, nulová kvalita"
-        strength = 2
-        
-    # C. SCÉNÁŘ: SMRTELNÝ BREJK (Counter Attack)
-    # Tým nemá míč, ale má velké šance
-    elif (s_a['poss'] < 35 and s_a['xg'] > 1.2 and g_a < 2):
-        tip = "⚔️ SMRTELNÝ BREJK (Host)"
-        sub_tip = "Málo míče, obří šance"
-        strength = 3
-        
-    # D. SCÉNÁŘ: XG VALUE (Klasika)
-    elif xg_diff > 1.6:
-        tip = "💎 VALUE OVER"
-        sub_tip = f"Chybí {round(xg_diff, 1)} gólu do spravedlnosti"
-        strength = 2
+    # B. VALUE TRAP (Spousta střel, žádná kvalita)
+    elif (s_h['shots'] > 12 and qual_h < 0.06 and g_h == 0):
+        tip = "⚠️ JALOVÝ TLAK (Dom)"
+        algo_color = "⚪" # Pozor na sázku
+    elif (s_a['shots'] > 12 and qual_a < 0.06 and g_a == 0):
+        tip = "⚠️ JALOVÝ TLAK (Host)"
+        algo_color = "⚪"
 
+    # C. HIGH xG VARIANCE (Gól musí padnout)
+    elif (luck_h < -1.2) or (luck_a < -1.2):
+        tip = "🔥 SMŮLA V KONCOVCE"
+        algo_color = "🔥" # Value na gól
+
+    # D. BUTCHER'S GAME (Hodně faulů)
+    elif (s_h['fouls'] + s_a['fouls']) > 25:
+        tip = "🥊 ŘEZNIČINA (Over Cards)"
+        algo_color = "🟨"
+
+    # E. INTENSITY OVERLOAD (Oba týmy útočí)
+    elif da_min_h > 1.0 and da_min_a > 1.0:
+        tip = "⚡ OTEVŘENÁ PARTIE"
+        algo_color = "⚡"
+
+    # FORMÁTOVÁNÍ TABULKY (Husté zobrazení dat)
     return {
-        "strength": strength,
-        "Min": f"{elapsed}'",
+        "Status": f"{elapsed}'",
         "Zápas": f"{teams['home']['name']} vs {teams['away']['name']}",
         "Skóre": f"<b>{g_h}:{g_a}</b>",
-        "Field Tilt": f"{home_tilt}% - {100-home_tilt}%",
-        "DA/min": f"{da_per_min_h} - {da_per_min_a}",
-        "xG (Kvalita)": f"{s_h['xg']} ({qual_h}) - {s_a['xg']} ({qual_a})",
-        "PREDIKCE": tip,
-        "Info": sub_tip
+        "PREDIKCE": f"{algo_color} {tip}" if tip else "",
+        
+        # --- SEKCE ÚTOK ---
+        "xG (Luck)": f"{s_h['xg']} ({luck_h}) / {s_a['xg']} ({luck_a})",
+        "Střely (Box)": f"{s_h['shots']}({s_h['sib']}) / {s_a['shots']}({s_a['sib']})",
+        "Kvalita (xG/S)": f"{qual_h} / {qual_a}",
+        "Bloky": f"{s_h['blocked']} / {s_a['blocked']}",
+        
+        # --- SEKCE INTENZITA ---
+        "DA/min": f"{da_min_h} / {da_min_a}",
+        "Rohy": f"{s_h['corners']} / {s_a['corners']}",
+        "Saves (GK)": f"{s_h['saves']} / {s_a['saves']}",
+        
+        # --- SEKCE DISCIPLÍNA & KONTROLA ---
+        "Fauly": f"{s_h['fouls']} / {s_a['fouls']}",
+        "Karty (Ž/Č)": f"{s_h['yc']}+{s_h['rc']} / {s_a['yc']}+{s_a['rc']}",
+        "Poss %": f"{s_h['poss']}% / {s_a['poss']}%"
     }
 
 # ================= FRONTEND =================
-st.set_page_config(page_title="PRO Bookie Scanner v3", layout="wide")
+st.set_page_config(page_title="PRO BOOKIE DASHBOARD", layout="wide")
 
-st.sidebar.header("⚙️ Nastavení")
-sel_league = st.sidebar.selectbox("Liga", list(LEAGUES.keys()))
-sel_id = LEAGUES[sel_league]
-min_min = st.sidebar.slider("Minuta zápasu od:", 0, 90, 20)
-
-st.title("🧠 PRO Bookie Scanner v3.0")
+# CSS pro zhutnění tabulky (aby se tam vešlo 12 sloupců)
 st.markdown("""
 <style>
-.small-font {font-size:12px !important; color: grey;}
+    div[data-testid="stDataFrame"] {font-size: 0.8rem;}
+    th {text-align: center !important;}
+    td {text-align: center !important;}
 </style>
-**Legenda:** * **Field Tilt:** Kdo ovládá území (nad 70% = drtivá převaha).
-* **DA/min:** Počet nebezpečných útoků za minutu (nad 1.0 = vysoké tempo).
-* **Falešná dominance:** Tým střílí, ale z dálky (nízké xG/střelu).
 """, unsafe_allow_html=True)
 
-if st.button("🔎 ANALYZOVAT JAKO BOOKMAKER", type="primary"):
-    with st.spinner(f'Načítám live data a počítám Field Tilt...'):
+st.sidebar.header("⚙️ Konfigurace")
+sel_league = st.sidebar.selectbox("Liga", list(LEAGUES.keys()))
+sel_id = LEAGUES[sel_league]
+min_min = st.sidebar.slider("Filtrovat minutu (od):", 0, 90, 10)
+
+st.title("📊 PRO BOOKIE DASHBOARD (14 Metrik)")
+st.caption("Detailní analýza trhu. Hledáme neefektivitu kurzů.")
+
+if st.button("🚀 SKENOVAT TRH", type="primary"):
+    with st.spinner(f'Stahuji data pro {sel_league}...'):
         matches = get_live_matches(sel_id)
+        # Filtr na minutu
         matches = [m for m in matches if m['fixture']['status']['elapsed'] >= min_min]
         
         if not matches:
-            st.warning("Žádné vhodné live zápasy.")
+            st.warning("Žádné aktivní zápasy splňující podmínky.")
         else:
             data = []
             bar = st.progress(0)
@@ -205,17 +209,16 @@ if st.button("🔎 ANALYZOVAT JAKO BOOKMAKER", type="primary"):
             
             if data:
                 df = pd.DataFrame(data)
-                df = df.sort_values(by=['strength', 'Min'], ascending=[False, False]).drop(columns=['strength'])
                 
-                # Stylování tabulky
-                def style_df(val):
-                    if '💣' in str(val): return 'background-color: #ffb3b3; color: black; font-weight: bold;' # Siege
-                    if '⚔️' in str(val): return 'background-color: #ffffb3; color: black; font-weight: bold;' # Counter
-                    if '⚠️' in str(val): return 'background-color: #e6e6e6; color: #555;' # Trap
-                    if '💎' in str(val): return 'background-color: #b3ffb3; color: black; font-weight: bold;' # Value
+                # Logika barvení řádků
+                def highlight_algo(val):
+                    if '🔥' in str(val): return 'background-color: #ffcccc; color: black; font-weight: bold;'
+                    if '🧱' in str(val): return 'background-color: #e6f7ff; color: black;'
+                    if '⚠️' in str(val): return 'background-color: #fff4cc; color: #444;'
+                    if '⚡' in str(val): return 'background-color: #f0f0f0; color: black;'
+                    if '🥊' in str(val): return 'background-color: #ffe6e6; color: black;'
                     return ''
 
-                # HTML renderování pro tučné písmo ve skóre
-                st.write(df.style.applymap(style_df, subset=['PREDIKCE']).to_html(escape=False), unsafe_allow_html=True)
+                st.write(df.style.applymap(highlight_algo, subset=['PREDIKCE']).to_html(escape=False), unsafe_allow_html=True)
             else:
-                st.info("Data jsou dostupná, ale žádný zápas nesplňuje kritéria pro anomálii.")
+                st.info("Zápasy běží, ale API zatím nedodalo statistiky (obvykle zpoždění 2-3 minuty od výkopu).")
