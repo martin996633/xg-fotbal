@@ -1,10 +1,15 @@
 import streamlit as st
 import requests
 import pandas as pd
-import time
 
-# --- CONFIGURATION & API SETUP ---
-API_KEY = "TVŮJ_RAPIDAPI_KLÍČ"  # Nahraď svým klíčem
+# --- CONFIGURATION ---
+# Načtení ze secrets s ošetřením chyb
+try:
+    API_KEY = st.secrets["api_key"].strip()
+except Exception:
+    st.error("Chybí 'api_key' v Streamlit Secrets! Prosím přidej ho do nastavení.")
+    st.stop()
+
 BASE_URL = "https://api-football-beta.p.rapidapi.com"
 HEADERS = {
     "X-RapidAPI-Key": API_KEY,
@@ -12,163 +17,128 @@ HEADERS = {
 }
 
 class LiveMatchData:
-    def __init__(self, api_key):
+    def __init__(self):
         self.headers = HEADERS
 
     def fetch_live_matches(self):
-        """Získá zápasy, které jsou aktuálně v poločase (HT)."""
         url = f"{BASE_URL}/fixtures"
-        querystring = {"live": "all"} # V produkci lze filtrovat konkrétní ligy
-        response = requests.get(url, headers=self.headers, params=querystring)
-        
-        if response.status_code == 200:
+        # Hledáme všechny live zápasy, filtrovat HT budeme až v logice
+        params = {"live": "all"}
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            response.raise_for_status()
             data = response.json().get('response', [])
-            # Filtrace pouze na poločas (HT)
-            ht_matches = [m for m in data if m['fixture']['status']['short'] == 'HT']
-            return ht_matches
-        return []
+            # Filtrace na poločas (HT)
+            return [m for m in data if m['fixture']['status']['short'] == 'HT']
+        except Exception as e:
+            st.error(f"Chyba při volání API (Fixtures): {e}")
+            return []
 
     def fetch_stats(self, fixture_id):
         url = f"{BASE_URL}/fixtures/statistics"
-        response = requests.get(url, headers=self.headers, params={"fixture": fixture_id})
-        return response.json().get('response', []) if response.status_code == 200 else []
+        try:
+            resp = requests.get(url, headers=self.headers, params={"fixture": fixture_id}, timeout=10)
+            return resp.json().get('response', [])
+        except:
+            return []
 
     def fetch_events(self, fixture_id):
         url = f"{BASE_URL}/fixtures/events"
-        response = requests.get(url, headers=self.headers, params={"fixture": fixture_id})
-        return response.json().get('response', []) if response.status_code == 200 else []
+        try:
+            resp = requests.get(url, headers=self.headers, params={"fixture": fixture_id}, timeout=10)
+            return resp.json().get('response', [])
+        except:
+            return []
 
-# --- ANALYTICAL ENGINE ---
-def calculate_proxy_xg(stats, events_list):
-    W_PENALTY = 0.79
-    W_SHOT_INSIDE = 0.13
-    W_SHOT_OUTSIDE = 0.03
-    W_SHOT_ON_TARGET_BONUS = 0.15
-    
-    # Bezpečné parsování statistik (ošetření null hodnot)
-    s = {item['type']: item['value'] if item['value'] is not None else 0 for item in stats}
-    
-    # Pomocné extrakce
-    sib = s.get('Shots insidebox', 0)
-    sob = s.get('Shots outsidebox', 0)
-    sog = s.get('Shots on Goal', 0)
-    
-    # Penalty count z eventů
-    penalties = sum(1 for e in events_list if e.get('type') == 'Penalty')
-    
-    raw_xg = (sib * W_SHOT_INSIDE) + (sob * W_SHOT_OUTSIDE)
-    accuracy_bonus = sog * W_SHOT_ON_TARGET_BONUS
-    penalty_xg = penalties * W_PENALTY
-    
-    return round(raw_xg + accuracy_bonus + penalty_xg, 2)
+# --- MATH FUNCTIONS (Heuristic xG & PI) ---
+def get_stat(stats_list, stat_name):
+    """Bezpečně vytáhne hodnotu statistiky z listu slovníků API."""
+    for s in stats_list:
+        if s['type'] == stat_name:
+            val = s['value']
+            if val is None: return 0
+            if isinstance(val, str) and "%" in val:
+                return float(val.replace('%', '')) / 100
+            return float(val)
+    return 0
 
-def calculate_pressure_index(stats):
-    s = {item['type']: (item['value'] if item['value'] is not None else 0) for item in stats}
-    
-    # Ošetření držení míče (string "55%" -> float 0.55)
-    possession_str = str(s.get('Ball Possession', '50%')).replace('%', '')
-    possession = float(possession_str) / 100
-    pos_diff = (possession * 100) - 50
-    
-    # Pokud API neposkytuje Dangerous Attacks, použijeme náhradní metriku (Total Shots + Corners)
-    da = s.get('Dangerous Attacks', 0)
-    corners = s.get('Corner Kicks', 0)
-    sog = s.get('Shots on Goal', 0)
-    
-    pi = (da * 1.0) + (corners * 3.0) + (sog * 5.0) + (pos_diff * 0.5)
-    return round(pi, 2)
+def run_analysis(match, engine):
+    f_id = match['fixture']['id']
+    stats_data = engine.fetch_stats(f_id)
+    events_data = engine.fetch_events(f_id)
 
-def predict_final_goals(home_xg, away_xg, home_pi, away_pi, score_home, score_away, has_red_card):
-    lambda_prior = 1.35  # Standard league avg for 2H
+    if len(stats_data) < 2:
+        return None
+
+    # Rozdělení statistik
+    h_s = stats_data[0]['statistics']
+    a_s = stats_data[1]['statistics']
+
+    # Výpočet xG Proxy
+    def calc_xg(s, evts):
+        penalties = sum(1 for e in evts if e.get('type') == 'Penalty')
+        return round((get_stat(s, 'Shots insidebox') * 0.13) + 
+                     (get_stat(s, 'Shots outsidebox') * 0.03) + 
+                     (get_stat(s, 'Shots on Goal') * 0.15) + 
+                     (penalties * 0.79), 2)
+
+    # Výpočet Pressure Indexu
+    def calc_pi(s):
+        pos_diff = (get_stat(s, 'Ball Possession') * 100) - 50
+        return round((get_stat(s, 'Corner Kicks') * 3.0) + 
+                     (get_stat(s, 'Shots on Goal') * 5.0) + 
+                     (pos_diff * 0.5), 2)
+
+    h_xg, a_xg = calc_xg(h_s, events_data), calc_xg(a_s, events_data)
+    h_pi, a_pi = calc_pi(h_s), calc_pi(a_s)
     
-    # 3.2 Live Performance Likelihood
-    lambda_live_home = (home_xg * 1.1) + (home_pi / 100)
-    lambda_live_away = (away_xg * 1.1) + (away_pi / 100)
+    # Bayesovská predikce 2H gólů
+    score_h = match['goals']['home'] or 0
+    score_a = match['goals']['away'] or 0
     
-    # 3.3 Game State Multipliers
-    m_h, m_a = 1.0, 1.0
-    diff = score_home - score_away
+    # Základní lambda + live performance
+    l_live = ((h_xg + a_xg) * 1.1) + ((h_pi + a_pi) / 150)
+    exp_2h = (1.35 * 0.3) + (l_live * 0.7)
     
-    if score_home == 0 and score_away == 0:
-        m_h, m_a = 1.10, 1.10
-    elif diff == -1: # Home losing by 1
-        m_h, m_a = 1.35, 0.90
-    elif abs(diff) >= 3: # Blowout
-        m_h, m_a = 0.60, 0.60
+    # Signalizace
+    signal = "Brak analýzy"
+    if score_h == 0 and score_a == 0 and (h_pi + a_pi) > 80:
+        signal = "🔥 OVER 0.5 GOALS (2H)"
+    elif (score_h < score_a) and (h_pi > a_pi * 1.8):
+        signal = "⭐ LATE GOAL FAVORITE"
+    elif (h_pi + a_pi) < 30:
+        signal = "❄️ DEAD GAME"
+
+    return {
+        "Zápas": f"{match['teams']['home']['name']} vs {match['teams']['away']['name']}",
+        "Skóre HT": f"{score_h}:{score_a}",
+        "Total xG": round(h_xg + a_xg, 2),
+        "Total PI": round(h_pi + a_pi, 2),
+        "Predikce 2H": round(exp_2h, 2),
+        "SIGNÁL": signal
+    }
+
+# --- UI ---
+st.set_page_config(page_title="2H Goal Engine", layout="wide")
+st.title("📊 Senior Quant: Live 2H Strategy")
+
+if st.button("Analyzovat HT zápasy"):
+    engine = LiveMatchData()
+    ht_matches = engine.fetch_live_matches()
     
-    if has_red_card: # Zjednodušeně pro celý tým
-        m_h *= 0.7 
+    if not ht_matches:
+        st.info("Momentálně nejsou v systému žádné zápasy ve fázi HT (poločas).")
+    else:
+        results = []
+        progress_bar = st.progress(0)
+        for idx, m in enumerate(ht_matches):
+            res = run_analysis(m, engine)
+            if res:
+                results.append(res)
+            progress_bar.progress((idx + 1) / len(ht_matches))
         
-    # 3.4 Final Calculation (Bayesian Fusion)
-    home_exp = ((lambda_prior * 0.3) + (lambda_live_home * 0.7)) * m_h
-    away_exp = ((lambda_prior * 0.3) + (lambda_live_away * 0.7)) * m_a
-    
-    return round(home_exp + away_exp, 2)
-
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="Pro-Bet 2H Engine", layout="wide")
-st.title("⚽ Live Football Goal Prediction Engine (HT Strategy)")
-st.write("Analyzuje probíhající zápasy v poločase a predikuje počet gólů ve 2. polovině.")
-
-if st.button('Refresh Live Data'):
-    engine = LiveMatchData(API_KEY)
-    with st.spinner('Stahuji data z API...'):
-        matches = engine.fetch_live_matches()
-        
-        if not matches:
-            st.warning("Aktuálně nejsou žádné zápasy v poločase (HT).")
-        else:
-            results = []
-            for match in matches:
-                f_id = match['fixture']['id']
-                home_name = match['teams']['home']['name']
-                away_name = match['teams']['away']['name']
-                score_h = match['score']['halftime']['home']
-                score_a = match['score']['halftime']['away']
-                
-                # Fetch Stats & Events
-                stats_data = engine.fetch_stats(f_id)
-                events_data = engine.fetch_events(f_id)
-                
-                if len(stats_data) < 2: continue # Přeskočit pokud nejsou statistiky
-                
-                # Předpokládáme index 0 = Home, 1 = Away (nutno ověřit v API odpovědi)
-                h_stats = stats_data[0]['statistics']
-                a_stats = stats_data[1]['statistics']
-                
-                # Výpočty
-                h_xg = calculate_proxy_xg(h_stats, events_data)
-                a_xg = calculate_proxy_xg(a_stats, events_data)
-                h_pi = calculate_pressure_index(h_stats)
-                a_pi = calculate_pressure_index(a_stats)
-                
-                has_red = any(e['type'] == 'Card' and 'Red' in e['detail'] for e in events_data)
-                
-                exp_2h = predict_final_goals(h_xg, a_xg, h_pi, a_pi, score_h, score_a, has_red)
-                
-                # Signalizační logika
-                signal = "NO SIGNAL"
-                total_pi = h_pi + a_pi
-                total_xg = h_xg + a_xg
-                
-                if score_h == 0 and score_a == 0 and total_pi > 80 and total_xg > 1.5:
-                    signal = "🔥 OVER 0.5 GOALS (2H)"
-                elif (score_h < score_a) and (h_pi > a_pi * 2):
-                    signal = "⭐ LATE GOAL FAVORITE (HOME)"
-                elif (h_pi + a_pi < 40) and (h_xg + a_xg < 0.5):
-                    signal = "❄️ DEAD GAME (UNDER)"
-
-                results.append({
-                    "Match": f"{home_name} vs {away_name}",
-                    "HT Score": f"{score_h}-{score_a}",
-                    "Home xG": h_xg,
-                    "Away xG": a_xg,
-                    "Total PI": total_pi,
-                    "Exp. 2H Goals": exp_2h,
-                    "Signal": signal
-                })
-
+        if results:
             df = pd.DataFrame(results)
-            st.table(df)
-
-st.sidebar.info("Tento systém používá Bayesian Poisson model kombinovaný s Pressure Indexem (PI) pro live trading.")
+            st.dataframe(df.style.highlight_max(subset=['Total PI'], color='lightgreen'))
+        else:
+            st.warning("Nepodařilo se získat dostatek statistik pro analýzu.")
